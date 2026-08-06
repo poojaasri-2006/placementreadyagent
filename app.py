@@ -1,7 +1,9 @@
 import os
+import io
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableLambda
@@ -83,7 +85,7 @@ career_agent = create_agent(
 )
 
 
-# --- 3. Request/response schema for the API ---
+# --- 3. Shared schema + helpers ---
 class CareerAgentInput(BaseModel):
     resume_text: str = Field(..., description="Full text extracted from the student's resume PDF")
     target_role: str = Field(..., description="Role the student is targeting, e.g. 'Machine Learning Engineer'")
@@ -132,7 +134,41 @@ career_chain = RunnableLambda(run_career_agent)
 # --- 4. FastAPI app ---
 app = FastAPI(title="Placement-Ready AI Career Agent")
 
+# Text-based route (unchanged) - good for programmatic callers that already
+# have resume text, and for LangServe's own /playground UI.
 add_routes(app, career_chain, path="/career-agent", playground_type="default")
+
+
+# --- 5. NEW: PDF upload route ---
+# LangServe routes are built from a JSON schema, so they can't accept a raw
+# file upload (multipart/form-data). This plain FastAPI endpoint accepts the
+# PDF, extracts its text with pypdf, and then runs the exact same agent logic.
+@app.post("/career-agent/upload")
+async def career_agent_upload(
+    resume_pdf: UploadFile = File(..., description="Student's resume as a PDF file"),
+    target_role: str = Form(...),
+    github_username: str = Form(...),
+):
+    if resume_pdf.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="resume_pdf must be a PDF file")
+
+    pdf_bytes = await resume_pdf.read()
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        resume_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+
+    if not resume_text.strip():
+        raise HTTPException(status_code=400, detail="No extractable text found in PDF")
+
+    payload = CareerAgentInput(
+        resume_text=resume_text,
+        target_role=target_role,
+        github_username=github_username,
+    )
+    return run_career_agent(payload)
+
 
 if __name__ == "__main__":
     import uvicorn
