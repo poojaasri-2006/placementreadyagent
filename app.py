@@ -2,6 +2,7 @@ import os
 import io
 import requests
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from langchain_core.tools import tool
@@ -134,15 +135,12 @@ career_chain = RunnableLambda(run_career_agent)
 # --- 4. FastAPI app ---
 app = FastAPI(title="Placement-Ready AI Career Agent")
 
-# Text-based route (unchanged) - good for programmatic callers that already
-# have resume text, and for LangServe's own /playground UI.
+# Text-based route - good for programmatic callers that already have resume
+# text, and for LangServe's own /career-agent/playground UI.
 add_routes(app, career_chain, path="/career-agent", playground_type="default")
 
 
-# --- 5. NEW: PDF upload route ---
-# LangServe routes are built from a JSON schema, so they can't accept a raw
-# file upload (multipart/form-data). This plain FastAPI endpoint accepts the
-# PDF, extracts its text with pypdf, and then runs the exact same agent logic.
+# --- 5. PDF upload route (the actual API used by the homepage form below) ---
 @app.post("/career-agent/upload")
 async def career_agent_upload(
     resume_pdf: UploadFile = File(..., description="Student's resume as a PDF file"),
@@ -168,6 +166,99 @@ async def career_agent_upload(
         github_username=github_username,
     )
     return run_career_agent(payload)
+
+
+# --- 6. NEW: homepage with a direct PDF-upload form ---
+# So students can go straight to the root URL and upload a PDF, instead of
+# navigating through /docs and finding /career-agent/upload manually.
+HOMEPAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Placement-Ready AI Career Agent</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    label { display: block; margin-top: 16px; font-weight: 600; font-size: 0.9rem; }
+    input[type=text], input[type=file] {
+      width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box;
+      border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem;
+    }
+    button {
+      margin-top: 20px; padding: 10px 20px; border: none; border-radius: 6px;
+      background: #4f46e5; color: white; font-size: 0.95rem; cursor: pointer;
+    }
+    button:disabled { background: #a5a5a5; cursor: not-allowed; }
+    #status { margin-top: 16px; font-size: 0.9rem; color: #555; }
+    pre {
+      margin-top: 16px; background: #f5f5f7; padding: 14px; border-radius: 8px;
+      white-space: pre-wrap; word-wrap: break-word; font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎓 Placement-Ready AI Career Agent</h1>
+  <p>Upload your resume PDF, tell it your target role and GitHub username, and it'll search jobs, find skill gaps, suggest projects, and check your GitHub activity.</p>
+
+  <form id="agentForm">
+    <label for="resume_pdf">Resume (PDF)</label>
+    <input type="file" id="resume_pdf" name="resume_pdf" accept="application/pdf" required />
+
+    <label for="target_role">Target Role</label>
+    <input type="text" id="target_role" name="target_role" placeholder="e.g. Machine Learning Engineer" required />
+
+    <label for="github_username">GitHub Username</label>
+    <input type="text" id="github_username" name="github_username" placeholder="e.g. octocat" required />
+
+    <button type="submit" id="submitBtn">Run Career Agent</button>
+  </form>
+
+  <div id="status"></div>
+  <pre id="result" style="display:none;"></pre>
+
+  <script>
+    const form = document.getElementById("agentForm");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const submitBtn = document.getElementById("submitBtn");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      resultEl.style.display = "none";
+      submitBtn.disabled = true;
+      statusEl.textContent = "Running agent... this can take 20-60 seconds.";
+
+      const formData = new FormData();
+      formData.append("resume_pdf", document.getElementById("resume_pdf").files[0]);
+      formData.append("target_role", document.getElementById("target_role").value);
+      formData.append("github_username", document.getElementById("github_username").value);
+
+      try {
+        const res = await fetch("/career-agent/upload", { method: "POST", body: formData });
+        const data = await res.json();
+        if (!res.ok) {
+          statusEl.textContent = "Error: " + (data.detail || res.statusText);
+        } else {
+          statusEl.textContent = "Done.";
+          resultEl.style.display = "block";
+          resultEl.textContent = JSON.stringify(data, null, 2);
+        }
+      } catch (err) {
+        statusEl.textContent = "Request failed: " + err;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
+    return HOMEPAGE_HTML
 
 
 if __name__ == "__main__":
