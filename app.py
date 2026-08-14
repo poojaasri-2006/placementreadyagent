@@ -168,17 +168,16 @@ async def career_agent_upload(
     return run_career_agent(payload)
 
 
-# --- 6. NEW: homepage with a direct PDF-upload form ---
-# So students can go straight to the root URL and upload a PDF, instead of
-# navigating through /docs and finding /career-agent/upload manually.
+# --- 6. Homepage with a direct PDF-upload form + formatted results ---
 HOMEPAGE_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Placement-Ready AI Career Agent</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.2/marked.min.js"></script>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+    body { font-family: system-ui, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
     h1 { font-size: 1.4rem; }
     label { display: block; margin-top: 16px; font-weight: 600; font-size: 0.9rem; }
     input[type=text], input[type=file] {
@@ -191,10 +190,27 @@ HOMEPAGE_HTML = """
     }
     button:disabled { background: #a5a5a5; cursor: not-allowed; }
     #status { margin-top: 16px; font-size: 0.9rem; color: #555; }
-    pre {
-      margin-top: 16px; background: #f5f5f7; padding: 14px; border-radius: 8px;
-      white-space: pre-wrap; word-wrap: break-word; font-size: 0.85rem;
+
+    #resultBox { display: none; margin-top: 24px; }
+    .meta-row {
+      display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 16px;
+      font-size: 0.85rem; color: #444;
     }
+    .meta-row div span { display: block; font-weight: 600; color: #111; }
+    .tools-used { margin-bottom: 20px; }
+    .tools-used span {
+      display: inline-block; background: #eef2ff; color: #4338ca;
+      padding: 3px 10px; border-radius: 999px; font-size: 0.78rem;
+      margin-right: 6px; margin-bottom: 6px;
+    }
+    #summaryOut {
+      background: #fafafa; border: 1px solid #eee; border-radius: 8px;
+      padding: 18px 20px; font-size: 0.92rem; line-height: 1.55;
+    }
+    #summaryOut h1, #summaryOut h2, #summaryOut h3 { margin-top: 1.2em; margin-bottom: 0.4em; }
+    #summaryOut ul { padding-left: 1.2em; }
+    #summaryOut table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.85rem; }
+    #summaryOut th, #summaryOut td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
   </style>
 </head>
 <body>
@@ -215,17 +231,29 @@ HOMEPAGE_HTML = """
   </form>
 
   <div id="status"></div>
-  <pre id="result" style="display:none;"></pre>
+
+  <div id="resultBox">
+    <div class="meta-row">
+      <div>Target Role<span id="roleOut"></span></div>
+      <div>GitHub<span id="ghOut"></span></div>
+    </div>
+    <div class="tools-used" id="toolsOut"></div>
+    <div id="summaryOut"></div>
+  </div>
 
   <script>
     const form = document.getElementById("agentForm");
     const statusEl = document.getElementById("status");
-    const resultEl = document.getElementById("result");
+    const resultBox = document.getElementById("resultBox");
+    const roleOut = document.getElementById("roleOut");
+    const ghOut = document.getElementById("ghOut");
+    const toolsOut = document.getElementById("toolsOut");
+    const summaryOut = document.getElementById("summaryOut");
     const submitBtn = document.getElementById("submitBtn");
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
-      resultEl.style.display = "none";
+      resultBox.style.display = "none";
       submitBtn.disabled = true;
       statusEl.textContent = "Running agent... this can take 20-60 seconds.";
 
@@ -241,8 +269,20 @@ HOMEPAGE_HTML = """
           statusEl.textContent = "Error: " + (data.detail || res.statusText);
         } else {
           statusEl.textContent = "Done.";
-          resultEl.style.display = "block";
-          resultEl.textContent = JSON.stringify(data, null, 2);
+          resultBox.style.display = "block";
+
+          roleOut.textContent = data.student_role || "";
+          ghOut.textContent = data.github_username || "";
+
+          toolsOut.innerHTML = "";
+          (data.tools_used || []).forEach(t => {
+            const el = document.createElement("span");
+            el.textContent = t;
+            toolsOut.appendChild(el);
+          });
+
+          // Render final_summary as real Markdown instead of a raw JSON string
+          summaryOut.innerHTML = marked.parse(data.final_summary || "(no summary returned)");
         }
       } catch (err) {
         statusEl.textContent = "Request failed: " + err;
@@ -255,12 +295,9 @@ HOMEPAGE_HTML = """
 </html>
 """
 
-
 @app.get("/", response_class=HTMLResponse)
 async def homepage():
     return HOMEPAGE_HTML
-
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
