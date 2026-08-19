@@ -1,10 +1,8 @@
 import os
-import io
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableLambda
@@ -16,171 +14,249 @@ from langserve import add_routes
 # --- 1. LLM ---
 llm = ChatGoogleGenerativeAI(
     model="gemma-4-31b-it",
-    google_api_key=os.environ.get("GOOGLE_APIKEY"),
+    google_api_key=os.environ.get("GOOGLE_API_KEY"),
     temperature=0.3,
 )
 
 search_engine = DuckDuckGoSearchResults()
 
-# --- 2. Tools (identical to the notebook versions) ---
-@tool
-def job_search(role: str) -> str:
-    """Search the web for current job openings matching a given role."""
-    query = f"{role} job openings India 2026"
-    return search_engine.invoke(query)
+# --- 2. Knowledge base ---
+# NOTE: replace this with the current wording copied from the live NPTEL
+# portal/FAQ before relying on this for real students — fees, dates, and
+# procedures change every term.
+nptel_knowledge_base = """
+NPTEL COURSE ENROLLMENT
+- Enrollment for each NPTEL course happens on the official NPTEL portal (onlinecourses.nptel.ac.in) during the announced enrollment window for that term.
+- Enrollment itself is free; only the certification exam has a fee.
+
+NPTEL EXAM REGISTRATION
+- Exam registration opens after a minimum number of weeks of the course have elapsed and closes on a published deadline shown on the course page.
+- Students must complete exam registration and payment separately from course enrollment.
+
+EXAMINATION FEE AND PAYMENT
+- The certification exam fee is charged per course and is shown on the exam registration page at the time of registration.
+- Payment can be made online via the modes listed on the NPTEL payment gateway page (net banking, cards, UPI, etc.).
+- A reduced fee may apply based on assignment performance during the course, as specified by NPTEL for that term.
+
+EXAM CITY AND CENTER
+- Students choose or change their preferred exam city during the exam registration window, subject to availability and any change-window deadlines set by NPTEL.
+- The final allotted exam center is communicated via the hall ticket before the exam date.
+
+ASSIGNMENTS
+- Each course specifies the number of graded weekly assignments and the minimum required for exam eligibility; this is published on the course page.
+
+EXAM DATES AND HALL TICKET
+- Exam dates are announced on the NPTEL portal for each term and are also emailed to registered students.
+- The hall ticket is released a short window before the exam and must be downloaded from the portal.
+
+CERTIFICATE
+- Certificates are issued based on meeting both the assignment score and exam score thresholds defined for the course.
+- Certificates are typically available for download from the portal a few weeks after results are declared.
+
+MISSED EXAM / ISSUES
+- Students who miss an exam should check the portal/FAQ for that term's policy on rescheduling, as NPTEL does not always offer makeup exams.
+- Payment or registration issues are generally resolved through the official NPTEL support/helpdesk channels listed on the portal.
+"""
+
+def extract_text_from_content(content) -> str:
+    """Normalize a message's .content into plain text. Gemini/LangChain
+    responses can come back as a plain string, OR as a list of content
+    blocks (e.g. a 'thinking' block followed by a 'text' block). This pulls
+    out only the actual answer text, skipping 'thinking'/reasoning blocks,
+    and joins multiple text blocks with blank lines."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, str):
+                text_parts.append(block.strip())
+            elif isinstance(block, dict):
+                block_type = block.get("type")
+                if block_type == "thinking":
+                    continue  # internal reasoning, never shown to the user
+                text = block.get("text", "")
+                if text.strip():
+                    text_parts.append(text.strip())
+        return "\n\n".join(text_parts).strip()
+    return str(content).strip()
 
 
+# --- 3. Tools ---
 @tool
-def skill_gap_analysis(role: str, resume_text: str) -> str:
-    """Compare the student's resume skills against the requirements of a target role and list missing skills."""
+def nptel_faq_lookup(query: str) -> str:
+    """Answer a question using the curated NPTEL knowledge base of registration, fee, exam, and certificate procedures."""
     prompt = (
-        f"You are a technical recruiter. Given this resume text:\n{resume_text}\n\n"
-        f"And the target role: '{role}'\n\n"
-        f"List the skills the candidate already has, and the skills they are missing "
-        f"for this role. Be concise and use bullet points."
+        f"You are an NPTEL exam support assistant. Using ONLY the information "
+        f"in this knowledge base:\n{nptel_knowledge_base}\n\n"
+        f"Answer the student's question: '{query}'\n\n"
+        f"If the knowledge base does not contain the answer, say so plainly "
+        f"instead of guessing, and suggest checking the official NPTEL portal."
     )
     response = llm.invoke(prompt)
-    return response.content if hasattr(response, "content") else str(response)
+    return extract_text_from_content(getattr(response, "content", str(response)))
 
 
 @tool
-def project_ideas(missing_skills: str) -> str:
-    """Suggest 3 practical project ideas to help a student build the given missing skills."""
+def nptel_web_search(query: str) -> str:
+    """Search the web for current NPTEL information (dates, fees, announcements) restricted to official NPTEL sources."""
+    search_query = f"site:nptel.ac.in OR site:onlinecourses.nptel.ac.in {query}"
+    return search_engine.invoke(search_query)
+
+
+@tool
+def step_by_step_guide(procedure: str) -> str:
+    """Generate a clear, numbered step-by-step guide for an NPTEL procedure (e.g. exam registration, fee payment, certificate download)."""
     prompt = (
-        f"Suggest 3 practical, resume-worthy project ideas that would help a student "
-        f"learn and demonstrate these missing skills: {missing_skills}. "
-        f"For each, give a one-line description."
+        f"You are an NPTEL exam support assistant. Using this knowledge base:\n"
+        f"{nptel_knowledge_base}\n\n"
+        f"Write a clear, numbered step-by-step guide for the following NPTEL "
+        f"procedure: '{procedure}'. Keep each step short and actionable."
     )
     response = llm.invoke(prompt)
-    return response.content if hasattr(response, "content") else str(response)
+    return extract_text_from_content(getattr(response, "content", str(response)))
 
 
-@tool
-def github_check(github_username: str) -> str:
-    """Check a student's GitHub profile for recent public repo activity and languages used."""
-    url = f"https://api.github.com/users/{github_username}/repos?sort=updated&per_page=5"
-    response = requests.get(url)
-    if response.status_code != 200:
-        return f"Could not fetch GitHub data for user: {github_username}"
-    repos = response.json()
-    summary = [
-        f"{repo['name']} (lang: {repo.get('language', 'N/A')}, updated: {repo['updated_at'][:10]})"
-        for repo in repos
-    ]
-    return "Recent repos: " + "; ".join(summary) if summary else "No public repos found."
+tools = [nptel_faq_lookup, nptel_web_search, step_by_step_guide]
 
-
-tools = [job_search, skill_gap_analysis, project_ideas, github_check]
-
-career_agent = create_agent(
+nptel_agent = create_agent(
     model=llm,
     tools=tools,
     system_prompt=(
-        "You are a Placement-Ready AI Career Agent for engineering students. "
-        "Given a student's resume, target role, and GitHub username, use the available "
-        "tools to: 1) find matching job openings, 2) identify skill gaps, "
-        "3) suggest relevant projects, and 4) check their GitHub activity. "
-        "Call multiple tools as needed before giving your final answer. "
-        "End with a clear, structured summary."
+        "You are the NPTEL Exam Support Agent, a virtual assistant for NPTEL "
+        "students. Given a student's natural-language question about course "
+        "enrollment, exam registration, fees, payment, exam city, assignments, "
+        "exam dates, certificates, or other NPTEL procedures, use the available "
+        "tools to find accurate, up-to-date information. Prefer the curated "
+        "knowledge base for stable facts and web search for anything that may "
+        "have changed recently (dates, announcements). Call multiple tools as "
+        "needed before giving your final answer. Where appropriate, point the "
+        "student to the relevant official NPTEL page. "
+        "Once you have enough information from your tools, STOP calling "
+        "tools and respond with your final answer as plain text. Always "
+        "end with a clear, concise, easy-to-understand written answer, and "
+        "give step-by-step guidance whenever the question involves a "
+        "procedure. Never end a turn with only a tool call and no text."
     ),
 )
 
 
-# --- 3. Shared schema + helpers ---
-class CareerAgentInput(BaseModel):
-    resume_text: str = Field(..., description="Full text extracted from the student's resume PDF")
-    target_role: str = Field(..., description="Role the student is targeting, e.g. 'Machine Learning Engineer'")
-    github_username: str = Field(..., description="Student's GitHub username")
+# --- 4. Request/response schema for the API ---
+class NptelAgentInput(BaseModel):
+    student_question: str = Field(..., description="The student's NPTEL-related question")
 
 
 def extract_final_text(agent_result: dict) -> str:
     for msg in reversed(agent_result.get("messages", [])):
         if msg.__class__.__name__ != "AIMessage":
             continue
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
-                    return block["text"]
+        text = extract_text_from_content(getattr(msg, "content", ""))
+        if text:
+            return text
     return ""
 
 
-def run_career_agent(payload: CareerAgentInput) -> dict:
+def collect_tool_outputs(agent_result: dict) -> str:
+    """Concatenate every ToolMessage's content, in order, as raw material
+    for a fallback synthesis step if the agent didn't produce a final
+    text answer on its own."""
+    chunks = []
+    for msg in agent_result.get("messages", []):
+        if msg.__class__.__name__ != "ToolMessage":
+            continue
+        name = getattr(msg, "name", "tool")
+        text = extract_text_from_content(getattr(msg, "content", ""))
+        if text:
+            chunks.append(f"[{name}]\n{text}")
+    return "\n\n".join(chunks)
+
+
+def run_nptel_agent(payload: dict) -> dict:
+    # LangServe delivers the input as a plain dict matching the pydantic
+    # schema's fields, not as an NptelAgentInput instance, so index into it
+    # directly rather than using attribute access.
+    student_question = payload["student_question"]
     query = (
-        f"My target role is '{payload.target_role}'. "
-        f"My GitHub username is '{payload.github_username}'. "
-        f"Here is my resume:\n{payload.resume_text}\n\n"
-        f"Please find job openings, analyze my skill gaps, suggest projects, "
-        f"and check my GitHub activity."
+        f"A student asked: '{student_question}'\n\n"
+        f"Please answer clearly, using the knowledge base and web search as "
+        f"needed, and give step-by-step guidance if the question involves a "
+        f"procedure."
     )
-    result = career_agent.invoke({"messages": [HumanMessage(content=query)]})
+    result = nptel_agent.invoke({"messages": [HumanMessage(content=query)]})
     tool_calls_made = [
         tc["name"]
         for msg in result["messages"]
         if hasattr(msg, "tool_calls") and msg.tool_calls
         for tc in msg.tool_calls
     ]
+
+    final_answer = extract_final_text(result)
+
+    # Fallback: the agent sometimes finishes its tool calls without ever
+    # emitting a final text-only message (e.g. it hit a step limit, or the
+    # last message was a tool call with no accompanying text). Rather than
+    # return an empty answer, synthesize one directly from the tool outputs
+    # that were already gathered, so the user always gets a real response.
+    if not final_answer:
+        tool_outputs = collect_tool_outputs(result)
+        if tool_outputs:
+            synth_prompt = (
+                f"A student asked: '{student_question}'\n\n"
+                f"Here is information gathered from your tools:\n\n{tool_outputs}\n\n"
+                f"Using ONLY this information, write a clear, concise, "
+                f"easy-to-understand answer for the student. Give numbered "
+                f"step-by-step guidance if the question involves a procedure."
+            )
+            synth_response = llm.invoke(synth_prompt)
+            final_answer = extract_text_from_content(
+                getattr(synth_response, "content", str(synth_response))
+            )
+        if not final_answer:
+            final_answer = (
+                "I wasn't able to find a confident answer to that question. "
+                "Please check the official NPTEL portal (onlinecourses.nptel.ac.in) directly."
+            )
+
     return {
-        "student_role": payload.target_role,
-        "github_username": payload.github_username,
+        "student_question": student_question,
         "tools_used": tool_calls_made,
-        "final_summary": extract_final_text(result),
+        "final_answer": final_answer,
     }
 
 
-career_chain = RunnableLambda(run_career_agent)
+# with_types tells LangServe/the playground to render a form based on
+# NptelAgentInput's fields, even though the function itself receives a dict.
+nptel_chain = RunnableLambda(run_nptel_agent).with_types(input_type=NptelAgentInput)
 
-# --- 4. FastAPI app ---
-app = FastAPI(title="Placement-Ready AI Career Agent")
+# --- 5. FastAPI app ---
+app = FastAPI(title="NPTEL Exam Support Agent")
 
-# Text-based route - good for programmatic callers that already have resume
-# text, and for LangServe's own /career-agent/playground UI.
-add_routes(app, career_chain, path="/career-agent", playground_type="default")
-
-
-# --- 5. PDF upload route (the actual API used by the homepage form below) ---
-@app.post("/career-agent/upload")
-async def career_agent_upload(
-    resume_pdf: UploadFile = File(..., description="Student's resume as a PDF file"),
-    target_role: str = Form(...),
-    github_username: str = Form(...),
-):
-    if resume_pdf.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="resume_pdf must be a PDF file")
-
-    pdf_bytes = await resume_pdf.read()
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        resume_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
-
-    if not resume_text.strip():
-        raise HTTPException(status_code=400, detail="No extractable text found in PDF")
-
-    payload = CareerAgentInput(
-        resume_text=resume_text,
-        target_role=target_role,
-        github_username=github_username,
-    )
-    return run_career_agent(payload)
+# Text-based route - good for programmatic callers, and for LangServe's own
+# /nptel-agent/playground debug UI.
+add_routes(app, nptel_chain, path="/nptel-agent", playground_type="default")
 
 
-# --- 6. Homepage with a direct PDF-upload form + formatted results ---
+# --- 6. Simple JSON route (the actual API used by the homepage form below) ---
+@app.post("/nptel-agent/ask")
+async def nptel_agent_ask(payload: NptelAgentInput):
+    if not payload.student_question.strip():
+        raise HTTPException(status_code=400, detail="student_question cannot be empty")
+    return run_nptel_agent({"student_question": payload.student_question})
+
+
+# --- 7. Homepage with a question form + formatted results ---
 HOMEPAGE_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Placement-Ready AI Career Agent</title>
+  <title>NPTEL Exam Support Agent</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.2/marked.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
     h1 { font-size: 1.4rem; }
     label { display: block; margin-top: 16px; font-weight: 600; font-size: 0.9rem; }
-    input[type=text], input[type=file] {
+    input[type=text] {
       width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box;
       border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem;
     }
@@ -203,67 +279,60 @@ HOMEPAGE_HTML = """
       padding: 3px 10px; border-radius: 999px; font-size: 0.78rem;
       margin-right: 6px; margin-bottom: 6px;
     }
-    #summaryOut {
+    #answerOut {
       background: #fafafa; border: 1px solid #eee; border-radius: 8px;
       padding: 18px 20px; font-size: 0.92rem; line-height: 1.55;
     }
-    #summaryOut h1, #summaryOut h2, #summaryOut h3 { margin-top: 1.2em; margin-bottom: 0.4em; }
-    #summaryOut ul { padding-left: 1.2em; }
-    #summaryOut table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.85rem; }
-    #summaryOut th, #summaryOut td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    #answerOut h1, #answerOut h2, #answerOut h3 { margin-top: 1.2em; margin-bottom: 0.4em; }
+    #answerOut ul, #answerOut ol { padding-left: 1.2em; }
+    #answerOut table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.85rem; }
+    #answerOut th, #answerOut td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
   </style>
 </head>
 <body>
-  <h1>🎓 Placement-Ready AI Career Agent</h1>
-  <p>Upload your resume PDF, tell it your target role and GitHub username, and it'll search jobs, find skill gaps, suggest projects, and check your GitHub activity.</p>
+  <h1>NPTEL Exam Support Agent</h1>
+  <p>Ask any question about NPTEL enrollment, exam registration, fees, exam city, assignments, exam dates, or certificates.</p>
 
   <form id="agentForm">
-    <label for="resume_pdf">Resume (PDF)</label>
-    <input type="file" id="resume_pdf" name="resume_pdf" accept="application/pdf" required />
+    <label for="student_question">Your Question</label>
+    <input type="text" id="student_question" name="student_question" placeholder="e.g. How do I register for the NPTEL exam?" required />
 
-    <label for="target_role">Target Role</label>
-    <input type="text" id="target_role" name="target_role" placeholder="e.g. Machine Learning Engineer" required />
-
-    <label for="github_username">GitHub Username</label>
-    <input type="text" id="github_username" name="github_username" placeholder="e.g. octocat" required />
-
-    <button type="submit" id="submitBtn">Run Career Agent</button>
+    <button type="submit" id="submitBtn">Ask the Agent</button>
   </form>
 
   <div id="status"></div>
 
   <div id="resultBox">
     <div class="meta-row">
-      <div>Target Role<span id="roleOut"></span></div>
-      <div>GitHub<span id="ghOut"></span></div>
+      <div>Question<span id="questionOut"></span></div>
     </div>
     <div class="tools-used" id="toolsOut"></div>
-    <div id="summaryOut"></div>
+    <div id="answerOut"></div>
   </div>
 
   <script>
     const form = document.getElementById("agentForm");
     const statusEl = document.getElementById("status");
     const resultBox = document.getElementById("resultBox");
-    const roleOut = document.getElementById("roleOut");
-    const ghOut = document.getElementById("ghOut");
+    const questionOut = document.getElementById("questionOut");
     const toolsOut = document.getElementById("toolsOut");
-    const summaryOut = document.getElementById("summaryOut");
+    const answerOut = document.getElementById("answerOut");
     const submitBtn = document.getElementById("submitBtn");
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       resultBox.style.display = "none";
       submitBtn.disabled = true;
-      statusEl.textContent = "Running agent... this can take 20-60 seconds.";
+      statusEl.textContent = "Running agent... this can take 10-30 seconds.";
 
-      const formData = new FormData();
-      formData.append("resume_pdf", document.getElementById("resume_pdf").files[0]);
-      formData.append("target_role", document.getElementById("target_role").value);
-      formData.append("github_username", document.getElementById("github_username").value);
+      const student_question = document.getElementById("student_question").value;
 
       try {
-        const res = await fetch("/career-agent/upload", { method: "POST", body: formData });
+        const res = await fetch("/nptel-agent/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ student_question }),
+        });
         const data = await res.json();
         if (!res.ok) {
           statusEl.textContent = "Error: " + (data.detail || res.statusText);
@@ -271,8 +340,7 @@ HOMEPAGE_HTML = """
           statusEl.textContent = "Done.";
           resultBox.style.display = "block";
 
-          roleOut.textContent = data.student_role || "";
-          ghOut.textContent = data.github_username || "";
+          questionOut.textContent = data.student_question || "";
 
           toolsOut.innerHTML = "";
           (data.tools_used || []).forEach(t => {
@@ -281,8 +349,8 @@ HOMEPAGE_HTML = """
             toolsOut.appendChild(el);
           });
 
-          // Render final_summary as real Markdown instead of a raw JSON string
-          summaryOut.innerHTML = marked.parse(data.final_summary || "(no summary returned)");
+          // Render final_answer as real Markdown instead of a raw JSON string
+          answerOut.innerHTML = marked.parse(data.final_answer || "(no answer returned)");
         }
       } catch (err) {
         statusEl.textContent = "Request failed: " + err;
@@ -298,6 +366,8 @@ HOMEPAGE_HTML = """
 @app.get("/", response_class=HTMLResponse)
 async def homepage():
     return HOMEPAGE_HTML
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
